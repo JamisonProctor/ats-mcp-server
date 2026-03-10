@@ -14,7 +14,9 @@ An MCP server that evaluates resumes against job descriptions using local LLM in
 ```bash
 git clone https://github.com/JamisonProctor/ats-mcp-server.git
 cd ats-mcp-server
-pip3 install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Test it works
@@ -39,7 +41,7 @@ Add the `ats-evaluator` entry to the `mcpServers` section:
 {
   "mcpServers": {
     "ats-evaluator": {
-      "command": "python3",
+      "command": "<path-to>/ats-mcp-server/.venv/bin/python3",
       "args": ["<path-to>/ats-mcp-server/ats_mcp_server.py"],
       "env": {
         "ATS_WORKSPACE": "<path-to-your-job-search-workspace>",
@@ -51,7 +53,8 @@ Add the `ats-evaluator` entry to the `mcpServers` section:
 }
 ```
 
-> **Note:** Replace `<path-to>` with the actual paths on your machine. Keep any existing
+> **Note:** Replace `<path-to>` with the actual paths on your machine. Using the venv
+> Python ensures dependencies are found without a global install. Keep any existing
 > MCP servers in the same config — just add this alongside them.
 
 After saving, **restart Claude Desktop** for the new MCP server to be picked up.
