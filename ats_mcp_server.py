@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
@@ -44,6 +43,12 @@ IDLE_TIMEOUT = int(os.environ.get("ATS_IDLE_TIMEOUT", "300"))  # seconds before 
 
 logger = logging.getLogger("ats-mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
+# ---------------------------------------------------------------------------
+# In-flight job tracking
+# ---------------------------------------------------------------------------
+
+_running_jobs: dict[str, dict] = {}  # job_folder_name -> status dict
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -93,12 +98,10 @@ async def _ensure_model(model: str) -> None:
         tags = r.json()
         available = {m["name"] for m in tags.get("models", [])}
 
-    # Ollama tags can be "model:tag" or just "model" (defaults to :latest)
     if model in available or f"{model}:latest" in available:
         logger.info(f"Model '{model}' is available.")
         return
 
-    # Check without tag
     base = model.split(":")[0]
     if any(m.startswith(base) for m in available):
         logger.info(f"Model '{model}' variant found.")
@@ -170,12 +173,7 @@ def resolve_workspace() -> Path:
 
 
 def find_jd(job_folder: Path) -> str:
-    """Find and read the job description text.
-
-    Priority:
-    1. jd.md in the job folder
-    2. jd.txt in the job folder
-    """
+    """Find and read the job description text."""
     for name in ("jd.md", "jd.txt"):
         jd_path = job_folder / name
         if jd_path.exists():
@@ -187,27 +185,21 @@ def find_jd(job_folder: Path) -> str:
 
 
 def find_resume(job_folder: Path, resume_filename: Optional[str] = None) -> tuple[str, str]:
-    """Find and extract text from the resume PDF in the job folder.
-
-    Returns (resume_text, resume_filename).
-    """
+    """Find and extract text from the resume PDF in the job folder."""
     if resume_filename:
         resume_path = job_folder / resume_filename
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume not found: {resume_path}")
         return extract_pdf_text(str(resume_path)), resume_filename
 
-    # Auto-detect: look for PDF files that look like resumes
     pdfs = list(job_folder.glob("*.pdf"))
     if not pdfs:
         raise FileNotFoundError(f"No PDF files found in '{job_folder}'.")
 
-    # Prefer files with "Jamison" or "Proctor" in the name
     resume_pdfs = [p for p in pdfs if "jamison" in p.name.lower() or "proctor" in p.name.lower()]
     if resume_pdfs:
         chosen = resume_pdfs[0]
     else:
-        # Skip files that look like reports
         non_report = [p for p in pdfs if "report" not in p.name.lower()]
         chosen = non_report[0] if non_report else pdfs[0]
 
@@ -255,7 +247,6 @@ def parse_ats_report(raw_text: str) -> dict:
                 value = None
             line_map[key] = value
 
-    # Top-level fields
     result["company"] = line_map.get("COMPANY")
     result["job_title"] = line_map.get("JOB_TITLE")
     result["location"] = line_map.get("LOCATION")
@@ -273,7 +264,6 @@ def parse_ats_report(raw_text: str) -> dict:
         except ValueError:
             result["rejection_likelihood"] = rl
 
-    # Requirements 1-8
     for i in range(1, 9):
         req = {
             "text": line_map.get(f"REQ_{i}_TEXT"),
@@ -288,10 +278,70 @@ def parse_ats_report(raw_text: str) -> dict:
                 req["confidence"] = float(conf)
             except ValueError:
                 req["confidence"] = conf
-        if req["text"]:  # only add if we got something
+        if req["text"]:
             result["requirements"].append(req)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Background eval task
+# ---------------------------------------------------------------------------
+
+
+async def _run_eval_background(
+    job_folder_name: str,
+    job_folder: Path,
+    workspace: Path,
+    resume_filename: Optional[str],
+    model: str,
+    output_version: str,
+) -> None:
+    """Run the eval in the background. Saves report to disk regardless of client state."""
+    status = _running_jobs[job_folder_name]
+    try:
+        jd_text = find_jd(job_folder)
+        resume_text, used_resume = find_resume(job_folder, resume_filename)
+        ats_prompt_template = read_ats_prompt(workspace)
+
+        full_prompt = (
+            f"{ats_prompt_template}\n\n"
+            f"--- JOB_DESCRIPTION ---\n{jd_text}\n\n"
+            f"--- RESUME ---\n{resume_text}\n"
+        )
+
+        await _ensure_ollama()
+        await _ensure_model(model)
+
+        logger.info(f"Running ATS eval with model '{model}' …")
+        status["status"] = "generating"
+        raw_report = await _generate(full_prompt, model)
+
+        parsed = parse_ats_report(raw_report)
+        parsed["model_used"] = model
+        parsed["resume_used"] = used_resume
+
+        suffix = f"_{output_version}" if output_version else ""
+
+        txt_path = job_folder / f"ats_report{suffix}.txt"
+        txt_path.write_text(raw_report, encoding="utf-8")
+
+        json_path = job_folder / f"ats_report{suffix}.json"
+        json_path.write_text(
+            json.dumps(parsed, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        status["status"] = "complete"
+        status["txt_path"] = str(txt_path)
+        status["json_path"] = str(json_path)
+        status["parsed"] = parsed
+        logger.info(f"ATS eval complete — saved to {txt_path}")
+
+    except Exception as e:
+        logger.exception("ATS eval failed")
+        status["status"] = "error"
+        status["error"] = str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -308,10 +358,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="run_ats_eval",
             description=(
-                "Run an ATS (Applicant Tracking System) evaluation of a resume "
-                "against a job description using a local LLM via Ollama. "
-                "Reads the JD and resume from the job folder, runs the evaluation, "
-                "saves the report, and returns structured results."
+                "Start an ATS evaluation of a resume against a job description. "
+                "Returns immediately — the eval runs in the background. "
+                "Use check_ats_eval to poll for results."
             ),
             inputSchema={
                 "type": "object",
@@ -330,18 +379,12 @@ async def list_tools() -> list[Tool]:
                             "If omitted, auto-detects the resume."
                         ),
                     },
-                    "model": {
-                        "type": "string",
-                        "description": (
-                            f"Optional: Ollama model to use. Default: {OLLAMA_MODEL}"
-                        ),
-                    },
                     "output_version": {
                         "type": "string",
                         "description": (
                             "Optional: version suffix for the report file "
                             "(e.g., 'v2' produces ats_report_v2.txt). "
-                            "Default: no suffix (ats_report.txt)."
+                            "Default: no suffix."
                         ),
                     },
                 },
@@ -349,9 +392,22 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="list_available_models",
-            description="List Ollama models available locally.",
-            inputSchema={"type": "object", "properties": {}},
+            name="check_ats_eval",
+            description=(
+                "Check the status of a running ATS evaluation. "
+                "Returns 'pending', 'generating', 'complete', or 'error'. "
+                "When complete, returns the full parsed report."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_folder_name": {
+                        "type": "string",
+                        "description": "The job folder name passed to run_ats_eval.",
+                    },
+                },
+                "required": ["job_folder_name"],
+            },
         ),
     ]
 
@@ -361,39 +417,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     global _last_activity
     _last_activity = time.monotonic()
 
-    if name == "list_available_models":
-        return await _handle_list_models()
-    elif name == "run_ats_eval":
+    if name == "run_ats_eval":
         return await _handle_run_ats_eval(arguments)
+    elif name == "check_ats_eval":
+        return await _handle_check_ats_eval(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def _handle_list_models() -> list[TextContent]:
-    """List locally available Ollama models."""
-    await _ensure_ollama()
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
-        tags = r.json()
-
-    models = []
-    for m in tags.get("models", []):
-        size_gb = m.get("size", 0) / (1024**3)
-        models.append(f"  {m['name']} ({size_gb:.1f} GB)")
-
-    text = "Available Ollama models:\n" + "\n".join(models) if models else "No models installed."
-    return [TextContent(type="text", text=text)]
-
-
 async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
-    """Run the full ATS evaluation pipeline."""
+    """Kick off the eval in the background and return immediately."""
     job_folder_name = arguments["job_folder_name"]
     resume_filename = arguments.get("resume_filename")
-    model = arguments.get("model", OLLAMA_MODEL)
+    model = OLLAMA_MODEL
     output_version = arguments.get("output_version", "")
 
     try:
-        # Resolve paths
         workspace = resolve_workspace()
         job_folder = workspace / "jobs" / job_folder_name
         if not job_folder.exists():
@@ -402,91 +441,87 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
                 text=f"Error: Job folder not found: {job_folder}",
             )]
 
-        # Read inputs
-        logger.info(f"Reading JD from {job_folder} …")
-        jd_text = find_jd(job_folder)
+        _running_jobs[job_folder_name] = {"status": "pending", "started": time.time()}
 
-        logger.info(f"Reading resume from {job_folder} …")
-        resume_text, used_resume = find_resume(job_folder, resume_filename)
+        asyncio.create_task(_run_eval_background(
+            job_folder_name, job_folder, workspace,
+            resume_filename, model, output_version,
+        ))
 
-        logger.info("Reading ATS eval prompt …")
-        ats_prompt_template = read_ats_prompt(workspace)
-
-        # Build the full prompt
-        full_prompt = (
-            f"{ats_prompt_template}\n\n"
-            f"--- JOB_DESCRIPTION ---\n{jd_text}\n\n"
-            f"--- RESUME ---\n{resume_text}\n"
-        )
-
-        # Ensure Ollama is running and model is available
-        await _ensure_ollama()
-        await _ensure_model(model)
-
-        # Run the evaluation
-        logger.info(f"Running ATS eval with model '{model}' …")
-        raw_report = await _generate(full_prompt, model)
-
-        # Parse the report
-        parsed = parse_ats_report(raw_report)
-        parsed["model_used"] = model
-        parsed["resume_used"] = used_resume
-
-        # Save outputs
-        suffix = f"_{output_version}" if output_version else ""
-
-        # Save raw text report
-        txt_path = job_folder / f"ats_report{suffix}.txt"
-        txt_path.write_text(raw_report, encoding="utf-8")
-
-        # Save parsed JSON report
-        json_path = job_folder / f"ats_report{suffix}.json"
-        json_path.write_text(
-            json.dumps(parsed, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        # Build summary for Claude
-        rl = parsed.get("rejection_likelihood", "?")
-        gaps = parsed.get("top_gaps", "None identified")
-        strengths = parsed.get("top_strengths", "None identified")
-        flags = parsed.get("screen_out_flags", "None")
-
-        reqs_summary = []
-        for r in parsed.get("requirements", []):
-            status_icon = {"met": "✓", "partial": "~", "missing": "✗"}.get(
-                r.get("status", ""), "?"
-            )
-            reqs_summary.append(
-                f"  {status_icon} {r.get('text', '?')} [{r.get('status', '?')}]"
-            )
-
-        summary = (
-            f"ATS Evaluation Complete\n"
-            f"Job: {parsed.get('company', '?')} — {parsed.get('job_title', '?')}\n"
-            f"Model: {model}\n"
-            f"Resume: {used_resume}\n"
-            f"\n"
-            f"Rejection Likelihood: {rl}\n"
-            f"\n"
-            f"Requirements:\n" + "\n".join(reqs_summary) + "\n"
-            f"\n"
-            f"Top Gaps: {gaps}\n"
-            f"Top Strengths: {strengths}\n"
-            f"Screen-out Flags: {flags}\n"
-            f"\n"
-            f"Reports saved to:\n"
-            f"  {txt_path}\n"
-            f"  {json_path}\n"
-            f"\n"
-            f"--- Raw Report ---\n{raw_report}"
-        )
-
-        return [TextContent(type="text", text=summary)]
+        return [TextContent(
+            type="text",
+            text=(
+                f"ATS evaluation started for '{job_folder_name}' using model '{model}'.\n"
+                f"Use check_ats_eval with job_folder_name='{job_folder_name}' to poll for results.\n"
+                f"This typically takes 2-5 minutes."
+            ),
+        )]
 
     except Exception as e:
-        logger.exception("ATS eval failed")
+        logger.exception("Failed to start ATS eval")
         return [TextContent(type="text", text=f"Error: {e}")]
+
+
+async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
+    """Check the status of a background eval."""
+    job_folder_name = arguments["job_folder_name"]
+
+    status = _running_jobs.get(job_folder_name)
+    if not status:
+        return [TextContent(
+            type="text",
+            text=f"No evaluation found for '{job_folder_name}'. Run run_ats_eval first.",
+        )]
+
+    if status["status"] == "pending":
+        elapsed = int(time.time() - status["started"])
+        return [TextContent(
+            type="text",
+            text=f"Status: pending (preparing inputs, {elapsed}s elapsed). Try again in 30s.",
+        )]
+
+    if status["status"] == "generating":
+        elapsed = int(time.time() - status["started"])
+        return [TextContent(
+            type="text",
+            text=f"Status: generating ({elapsed}s elapsed). Ollama is still working. Try again in 60s.",
+        )]
+
+    if status["status"] == "error":
+        return [TextContent(
+            type="text",
+            text=f"Status: error\n{status['error']}",
+        )]
+
+    # Complete
+    parsed = status["parsed"]
+    rl = parsed.get("rejection_likelihood", "?")
+    gaps = parsed.get("top_gaps", "None identified")
+    strengths = parsed.get("top_strengths", "None identified")
+    flags = parsed.get("screen_out_flags", "None")
+
+    reqs_summary = []
+    for r in parsed.get("requirements", []):
+        icon = {"met": "✓", "partial": "~", "missing": "✗"}.get(r.get("status", ""), "?")
+        reqs_summary.append(f"  {icon} {r.get('text', '?')} [{r.get('status', '?')}]")
+
+    summary = (
+        f"Status: complete\n\n"
+        f"Job: {parsed.get('company', '?')} — {parsed.get('job_title', '?')}\n"
+        f"Model: {parsed.get('model_used', '?')}\n"
+        f"Resume: {parsed.get('resume_used', '?')}\n\n"
+        f"Rejection Likelihood: {rl}\n\n"
+        f"Requirements:\n" + "\n".join(reqs_summary) + "\n\n"
+        f"Top Gaps: {gaps}\n"
+        f"Top Strengths: {strengths}\n"
+        f"Screen-out Flags: {flags}\n\n"
+        f"Reports saved to:\n"
+        f"  {status['txt_path']}\n"
+        f"  {status['json_path']}\n\n"
+        f"--- Raw Report ---\n{parsed.get('raw_report', '')}"
+    )
+
+    return [TextContent(type="text", text=summary)]
 
 
 # ---------------------------------------------------------------------------
@@ -497,9 +532,11 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 async def _idle_watchdog():
     """Shut down the server after IDLE_TIMEOUT seconds of inactivity."""
     while True:
-        await asyncio.sleep(30)  # check every 30s
+        await asyncio.sleep(30)
         idle = time.monotonic() - _last_activity
-        if idle >= IDLE_TIMEOUT:
+        # Don't shut down if there are running jobs
+        active = any(j["status"] in ("pending", "generating") for j in _running_jobs.values())
+        if idle >= IDLE_TIMEOUT and not active:
             logger.info(
                 f"No activity for {IDLE_TIMEOUT}s — shutting down. "
                 "Claude Desktop will restart the server on next tool call."
