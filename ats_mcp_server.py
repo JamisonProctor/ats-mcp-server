@@ -128,6 +128,7 @@ async def _generate(prompt: str, model: str) -> str:
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
+                "think": False,
                 "options": {
                     "temperature": 0,
                     "num_predict": 4096,
