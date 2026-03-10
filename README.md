@@ -1,4 +1,6 @@
-# ATS Evaluation MCP Server — Setup Guide
+# ATS Evaluation MCP Server
+
+An MCP server that evaluates resumes against job descriptions using local LLM inference via Ollama. Designed to be called as a tool from Claude Desktop.
 
 ## Prerequisites
 
@@ -7,10 +9,11 @@
 - **A model pulled** — recommended: `ollama pull qwen2.5:14b` (best for 16GB RAM)
   - Fallback if too slow: `ollama pull llama3.1:8b`
 
-## Install dependencies
+## Install
 
 ```bash
-cd ~/Desktop/Job\ Search\ 2026/tools
+git clone https://github.com/JamisonProctor/ats-mcp-server.git
+cd ats-mcp-server
 pip3 install -r requirements.txt
 ```
 
@@ -37,9 +40,9 @@ Add the `ats-evaluator` entry to the `mcpServers` section:
   "mcpServers": {
     "ats-evaluator": {
       "command": "python3",
-      "args": ["/Users/jamisonproctor/Desktop/Job Search 2026/tools/ats_mcp_server.py"],
+      "args": ["<path-to>/ats-mcp-server/ats_mcp_server.py"],
       "env": {
-        "ATS_WORKSPACE": "/Users/jamisonproctor/Desktop/Job Search 2026",
+        "ATS_WORKSPACE": "<path-to-your-job-search-workspace>",
         "OLLAMA_MODEL": "qwen2.5:14b",
         "OLLAMA_HOST": "http://localhost:11434"
       }
@@ -48,8 +51,8 @@ Add the `ats-evaluator` entry to the `mcpServers` section:
 }
 ```
 
-> **Note:** Adjust the paths if your workspace folder is elsewhere. Keep any existing
-> MCP servers (like obsidian) in the same config — just add this alongside them.
+> **Note:** Replace `<path-to>` with the actual paths on your machine. Keep any existing
+> MCP servers in the same config — just add this alongside them.
 
 After saving, **restart Claude Desktop** for the new MCP server to be picked up.
 
@@ -57,13 +60,27 @@ After saving, **restart Claude Desktop** for the new MCP server to be picked up.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ATS_WORKSPACE` | `~/Desktop/Job Search 2026` | Path to the workspace root |
+| `ATS_WORKSPACE` | `~/Desktop/Job Search 2026` | Path to the workspace root containing `jobs/` and `prompts/` |
 | `OLLAMA_MODEL` | `qwen2.5:14b` | Default Ollama model |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 
+## Workspace structure
+
+The server expects this layout in your `ATS_WORKSPACE`:
+
+```
+<workspace>/
+├── prompts/
+│   └── ats_eval.md          # Eval prompt template (included in this repo)
+└── jobs/
+    └── <company__role>/
+        ├── jd.md             # Job description
+        └── resume.pdf        # Resume to evaluate
+```
+
 ## Available tools
 
-Once registered, Claude will see two new tools:
+Once registered, Claude will see two tools:
 
 ### `run_ats_eval`
 Runs a full ATS evaluation. Requires `job_folder_name` (the folder name under `jobs/`).
