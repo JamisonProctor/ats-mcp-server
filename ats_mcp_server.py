@@ -52,9 +52,14 @@ _job_queue: asyncio.Queue | None = None
 _queue_order: list[str] = []  # ordered list of queued job keys
 
 
-def _job_key(folder_name: str, output_version: str = "") -> str:
-    """Build a unique job key from folder name + output version."""
-    return f"{folder_name}::{output_version}" if output_version else folder_name
+def _sanitize_model_name(model: str) -> str:
+    """Sanitize a model name for use in filenames (e.g. 'qwen3.5:9b' → 'qwen3.5-9b')."""
+    return model.replace(":", "-").replace("/", "-")
+
+
+def _job_key(folder_name: str, model: str = "") -> str:
+    """Build a unique job key from folder name + model."""
+    return f"{folder_name}::{model}" if model else folder_name
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -331,7 +336,6 @@ async def _run_eval_background(
     workspace: Path,
     resume_filename: Optional[str],
     model: str,
-    output_version: str,
 ) -> None:
     """Run the eval in the background. Saves report to disk regardless of client state."""
     status = _running_jobs[job_key]
@@ -361,12 +365,12 @@ async def _run_eval_background(
         fit = compute_fit_score(parsed)
         parsed.update(fit)
 
-        suffix = f"_{output_version}" if output_version else ""
+        model_slug = _sanitize_model_name(model)
 
-        txt_path = job_folder / f"ats_report{suffix}.txt"
+        txt_path = job_folder / f"ats_report_{model_slug}.txt"
         txt_path.write_text(raw_report, encoding="utf-8")
 
-        json_path = job_folder / f"ats_report{suffix}.json"
+        json_path = job_folder / f"ats_report_{model_slug}.json"
         json_path.write_text(
             json.dumps(parsed, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -440,14 +444,6 @@ async def list_tools() -> list[Tool]:
                             "If omitted, auto-detects the resume."
                         ),
                     },
-                    "output_version": {
-                        "type": "string",
-                        "description": (
-                            "Optional: version suffix for the report file "
-                            "(e.g., 'v2' produces ats_report_v2.txt). "
-                            "Default: no suffix."
-                        ),
-                    },
                 },
                 "required": ["job_folder_name"],
             },
@@ -465,13 +461,6 @@ async def list_tools() -> list[Tool]:
                     "job_folder_name": {
                         "type": "string",
                         "description": "The job folder name passed to run_ats_eval.",
-                    },
-                    "output_version": {
-                        "type": "string",
-                        "description": (
-                            "Optional: the output_version used when starting the eval. "
-                            "Required if you used output_version in run_ats_eval."
-                        ),
                     },
                 },
                 "required": ["job_folder_name"],
@@ -496,8 +485,6 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 
     job_folder_name = arguments["job_folder_name"]
     resume_filename = arguments.get("resume_filename")
-    output_version = arguments.get("output_version", "")
-
     try:
         workspace = resolve_workspace()
         job_folder = workspace / "jobs" / job_folder_name
@@ -507,13 +494,13 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
                 text=f"Error: Job folder not found: {job_folder}",
             )]
 
-        key = _job_key(job_folder_name, output_version)
+        key = _job_key(job_folder_name, OLLAMA_MODEL)
         _running_jobs[key] = {"status": "queued", "started": time.time()}
         _queue_order.append(key)
 
         await _job_queue.put((
             key, job_folder, workspace,
-            resume_filename, OLLAMA_MODEL, output_version,
+            resume_filename, OLLAMA_MODEL,
         ))
 
         position = len(_queue_order)
@@ -521,16 +508,11 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
         if position > 1:
             queue_msg = f" Queue position: {position} of {position}."
 
-        version_hint = ""
-        if output_version:
-            version_hint = f" (output_version='{output_version}')"
-
         return [TextContent(
             type="text",
             text=(
-                f"ATS evaluation queued for '{job_folder_name}' using model '{OLLAMA_MODEL}'.{queue_msg}{version_hint}\n"
+                f"ATS evaluation queued for '{job_folder_name}' using model '{OLLAMA_MODEL}'.{queue_msg}\n"
                 f"Use check_ats_eval with job_folder_name='{job_folder_name}'"
-                f"{f' and output_version={output_version!r}' if output_version else ''}"
                 f" to poll for results.\n"
                 f"This typically takes 2-5 minutes per eval."
             ),
@@ -544,8 +526,7 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
     """Check the status of a background eval."""
     job_folder_name = arguments["job_folder_name"]
-    output_version = arguments.get("output_version", "")
-    key = _job_key(job_folder_name, output_version)
+    key = _job_key(job_folder_name, OLLAMA_MODEL)
 
     status = _running_jobs.get(key)
     if not status:
