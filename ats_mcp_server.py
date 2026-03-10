@@ -206,9 +206,9 @@ def find_resume(job_folder: Path, resume_filename: Optional[str] = None) -> tupl
     return extract_pdf_text(str(chosen)), chosen.name
 
 
-def read_ats_prompt(workspace: Path) -> str:
-    """Read the ATS evaluation prompt template."""
-    prompt_path = workspace / "prompts" / "ats_eval.md"
+def read_ats_prompt() -> str:
+    """Read the ATS evaluation prompt template from the repo."""
+    prompt_path = Path(__file__).parent / "prompts" / "ats_eval.md"
     if not prompt_path.exists():
         raise FileNotFoundError(f"ATS eval prompt not found at '{prompt_path}'.")
     return prompt_path.read_text(encoding="utf-8")
@@ -302,7 +302,7 @@ async def _run_eval_background(
     try:
         jd_text = find_jd(job_folder)
         resume_text, used_resume = find_resume(job_folder, resume_filename)
-        ats_prompt_template = read_ats_prompt(workspace)
+        ats_prompt_template = read_ats_prompt()
 
         full_prompt = (
             f"{ats_prompt_template}\n\n"
