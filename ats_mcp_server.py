@@ -125,16 +125,6 @@ async def _ensure_model(model: str) -> None:
     logger.info(f"Model '{model}' pulled successfully.")
 
 
-async def _list_ollama_models() -> list[str]:
-    """Return list of locally available Ollama model names."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
-            tags = r.json()
-            return [m["name"] for m in tags.get("models", [])]
-    except (httpx.ConnectError, httpx.TimeoutException):
-        return []
-
 
 async def _generate(prompt: str, model: str) -> str:
     """Send a generate request to Ollama and return the response text."""
@@ -453,15 +443,6 @@ async def list_tools() -> list[Tool]:
                             "Default: no suffix."
                         ),
                     },
-                    "model": {
-                        "type": "string",
-                        "description": (
-                            "Optional: Ollama model to use for this eval "
-                            "(e.g., 'qwen3.5:9b', 'mistral:7b', 'llama3.1:8b'). "
-                            "Use list_available_models to see installed models. "
-                            "Default: OLLAMA_MODEL env var."
-                        ),
-                    },
                 },
                 "required": ["job_folder_name"],
             },
@@ -491,17 +472,6 @@ async def list_tools() -> list[Tool]:
                 "required": ["job_folder_name"],
             },
         ),
-        Tool(
-            name="list_available_models",
-            description=(
-                "List locally installed Ollama models. "
-                "Use this to see what models are available before running an eval."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
     ]
 
 
@@ -511,8 +481,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return await _handle_run_ats_eval(arguments)
     elif name == "check_ats_eval":
         return await _handle_check_ats_eval(arguments)
-    elif name == "list_available_models":
-        return await _handle_list_models(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -523,7 +491,6 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 
     job_folder_name = arguments["job_folder_name"]
     resume_filename = arguments.get("resume_filename")
-    model = arguments.get("model") or OLLAMA_MODEL
     output_version = arguments.get("output_version", "")
 
     try:
@@ -541,7 +508,7 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 
         await _job_queue.put((
             key, job_folder, workspace,
-            resume_filename, model, output_version,
+            resume_filename, OLLAMA_MODEL, output_version,
         ))
 
         position = len(_queue_order)
@@ -556,7 +523,7 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
         return [TextContent(
             type="text",
             text=(
-                f"ATS evaluation queued for '{job_folder_name}' using model '{model}'.{queue_msg}{version_hint}\n"
+                f"ATS evaluation queued for '{job_folder_name}' using model '{OLLAMA_MODEL}'.{queue_msg}{version_hint}\n"
                 f"Use check_ats_eval with job_folder_name='{job_folder_name}'"
                 f"{f' and output_version={output_version!r}' if output_version else ''}"
                 f" to poll for results.\n"
@@ -643,21 +610,6 @@ async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
 
     return [TextContent(type="text", text=summary)]
 
-
-async def _handle_list_models(arguments: dict) -> list[TextContent]:
-    """List locally available Ollama models."""
-    try:
-        await _ensure_ollama()
-        models = await _list_ollama_models()
-        if not models:
-            return [TextContent(type="text", text="No models installed. Pull one with 'ollama pull <model>'.")]
-        model_list = "\n".join(f"  - {m}" for m in sorted(models))
-        return [TextContent(
-            type="text",
-            text=f"Available Ollama models:\n{model_list}\n\nDefault: {OLLAMA_MODEL}",
-        )]
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error listing models: {e}")]
 
 
 # ---------------------------------------------------------------------------
