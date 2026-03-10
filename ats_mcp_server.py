@@ -48,9 +48,14 @@ logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 # In-flight job tracking + sequential queue
 # ---------------------------------------------------------------------------
 
-_running_jobs: dict[str, dict] = {}  # job_folder_name -> status dict
+_running_jobs: dict[str, dict] = {}  # job_key -> status dict
 _job_queue: asyncio.Queue | None = None
 _queue_order: list[str] = []  # ordered list of queued job keys
+
+
+def _job_key(folder_name: str, output_version: str = "") -> str:
+    """Build a unique job key from folder name + output version."""
+    return f"{folder_name}::{output_version}" if output_version else folder_name
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -319,7 +324,7 @@ def compute_fit_score(parsed: dict) -> dict:
 
 
 async def _run_eval_background(
-    job_folder_name: str,
+    job_key: str,
     job_folder: Path,
     workspace: Path,
     resume_filename: Optional[str],
@@ -327,7 +332,7 @@ async def _run_eval_background(
     output_version: str,
 ) -> None:
     """Run the eval in the background. Saves report to disk regardless of client state."""
-    status = _running_jobs[job_folder_name]
+    status = _running_jobs[job_key]
     try:
         jd_text = find_jd(job_folder)
         resume_text, used_resume = find_resume(job_folder, resume_filename)
@@ -387,7 +392,7 @@ async def _queue_worker():
     global _job_queue
     while True:
         job_args = await _job_queue.get()
-        job_key = job_args[0]  # job_folder_name
+        job_key = job_args[0]
         try:
             await _run_eval_background(*job_args)
         except Exception:
@@ -469,6 +474,13 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The job folder name passed to run_ats_eval.",
                     },
+                    "output_version": {
+                        "type": "string",
+                        "description": (
+                            "Optional: the output_version used when starting the eval. "
+                            "Required if you used output_version in run_ats_eval."
+                        ),
+                    },
                 },
                 "required": ["job_folder_name"],
             },
@@ -520,11 +532,12 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
                 text=f"Error: Job folder not found: {job_folder}",
             )]
 
-        _running_jobs[job_folder_name] = {"status": "queued", "started": time.time()}
-        _queue_order.append(job_folder_name)
+        key = _job_key(job_folder_name, output_version)
+        _running_jobs[key] = {"status": "queued", "started": time.time()}
+        _queue_order.append(key)
 
         await _job_queue.put((
-            job_folder_name, job_folder, workspace,
+            key, job_folder, workspace,
             resume_filename, model, output_version,
         ))
 
@@ -533,11 +546,17 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
         if position > 1:
             queue_msg = f" Queue position: {position} of {position}."
 
+        version_hint = ""
+        if output_version:
+            version_hint = f" (output_version='{output_version}')"
+
         return [TextContent(
             type="text",
             text=(
-                f"ATS evaluation queued for '{job_folder_name}' using model '{model}'.{queue_msg}\n"
-                f"Use check_ats_eval with job_folder_name='{job_folder_name}' to poll for results.\n"
+                f"ATS evaluation queued for '{job_folder_name}' using model '{model}'.{queue_msg}{version_hint}\n"
+                f"Use check_ats_eval with job_folder_name='{job_folder_name}'"
+                f"{f' and output_version={output_version!r}' if output_version else ''}"
+                f" to poll for results.\n"
                 f"This typically takes 2-5 minutes per eval."
             ),
         )]
@@ -550,17 +569,19 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
     """Check the status of a background eval."""
     job_folder_name = arguments["job_folder_name"]
+    output_version = arguments.get("output_version", "")
+    key = _job_key(job_folder_name, output_version)
 
-    status = _running_jobs.get(job_folder_name)
+    status = _running_jobs.get(key)
     if not status:
         return [TextContent(
             type="text",
-            text=f"No evaluation found for '{job_folder_name}'. Run run_ats_eval first.",
+            text=f"No evaluation found for '{key}'. Run run_ats_eval first.",
         )]
 
     if status["status"] == "queued":
         elapsed = int(time.time() - status["started"])
-        position = _queue_order.index(job_folder_name) + 1 if job_folder_name in _queue_order else "?"
+        position = _queue_order.index(key) + 1 if key in _queue_order else "?"
         total = len(_queue_order)
         return [TextContent(
             type="text",
