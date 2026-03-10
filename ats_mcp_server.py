@@ -32,7 +32,7 @@ from mcp.types import TextContent, Tool
 # ---------------------------------------------------------------------------
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:9b")
 WORKSPACE = os.environ.get(
     "ATS_WORKSPACE",
     str(Path.home() / "Desktop" / "Job Search 2026"),
