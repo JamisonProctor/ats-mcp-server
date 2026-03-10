@@ -273,8 +273,15 @@ def parse_ats_report(raw_text: str) -> dict:
     result["top_strengths"] = line_map.get("TOP_STRENGTHS")
     result["notes"] = line_map.get("NOTES")
 
-    for i in range(1, 9):
+    # Parse REQ_COUNT if present, otherwise scan up to 10
+    try:
+        req_count = int(line_map.get("REQ_COUNT", "10"))
+    except ValueError:
+        req_count = 10
+
+    for i in range(1, req_count + 1):
         req = {
+            "req_num": i,
             "text": line_map.get(f"REQ_{i}_TEXT"),
             "status": line_map.get(f"REQ_{i}_STATUS"),
             "evidence": line_map.get(f"REQ_{i}_EVIDENCE"),
@@ -284,12 +291,13 @@ def parse_ats_report(raw_text: str) -> dict:
         raw_score = line_map.get(f"REQ_{i}_FIT_SCORE")
         if raw_score is not None:
             try:
-                req["fit_score"] = int(raw_score)
+                score = int(raw_score)
             except ValueError:
                 try:
-                    req["fit_score"] = int(float(raw_score))
+                    score = int(float(raw_score))
                 except ValueError:
-                    req["fit_score"] = 0
+                    score = 0
+            req["fit_score"] = max(0, min(4, score))  # clamp to 0-4
         if req["text"]:
             result["requirements"].append(req)
 
@@ -308,7 +316,7 @@ def compute_fit_score(parsed: dict) -> dict:
         return {"overall_fit_pct": 0.0, "total_score": 0, "max_possible": 0}
 
     total = sum(r.get("fit_score") or 0 for r in reqs)
-    max_possible = len(reqs) * 10
+    max_possible = len(reqs) * 4  # 0-4 scale
     overall = round((total / max_possible) * 100, 1)
 
     return {
@@ -620,7 +628,8 @@ async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
     for r in parsed.get("requirements", []):
         icon = {"met": "✓", "partial": "~", "missing": "✗"}.get(r.get("status", ""), "?")
         score = r.get("fit_score", "?")
-        reqs_summary.append(f"  {icon} [{score}/10] {r.get('text', '?')} [{r.get('status', '?')}]")
+        req_num = r.get("req_num", "?")
+        reqs_summary.append(f"  {icon} REQ_{req_num} [{score}/4] {r.get('text', '?')} [{r.get('status', '?')}]")
 
     summary = (
         f"Status: complete\n\n"
