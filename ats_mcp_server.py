@@ -40,6 +40,7 @@ WORKSPACE = os.environ.get(
 
 OLLAMA_TIMEOUT = 300  # seconds — large models can be slow on first load
 OLLAMA_START_TIMEOUT = 30  # seconds to wait for ollama serve to come up
+IDLE_TIMEOUT = int(os.environ.get("ATS_IDLE_TIMEOUT", "300"))  # seconds before auto-shutdown
 
 logger = logging.getLogger("ats-mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -298,6 +299,7 @@ def parse_ats_report(raw_text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 app = Server("ats-evaluator")
+_last_activity = time.monotonic()
 
 
 @app.list_tools()
@@ -356,6 +358,9 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    global _last_activity
+    _last_activity = time.monotonic()
+
     if name == "list_available_models":
         return await _handle_list_models()
     elif name == "run_ats_eval":
@@ -489,8 +494,22 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 
+async def _idle_watchdog():
+    """Shut down the server after IDLE_TIMEOUT seconds of inactivity."""
+    while True:
+        await asyncio.sleep(30)  # check every 30s
+        idle = time.monotonic() - _last_activity
+        if idle >= IDLE_TIMEOUT:
+            logger.info(
+                f"No activity for {IDLE_TIMEOUT}s — shutting down. "
+                "Claude Desktop will restart the server on next tool call."
+            )
+            os._exit(0)
+
+
 async def main():
     async with stdio_server() as (read_stream, write_stream):
+        asyncio.create_task(_idle_watchdog())
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
