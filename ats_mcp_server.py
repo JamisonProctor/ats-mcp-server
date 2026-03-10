@@ -268,11 +268,16 @@ def parse_ats_report(raw_text: str) -> dict:
     except ValueError:
         req_count = 10
 
+    _valid_statuses = {"met", "partial", "missing"}
+
     for i in range(1, req_count + 1):
+        raw_status = line_map.get(f"REQ_{i}_STATUS")
+        status = raw_status if raw_status in _valid_statuses else None
         req = {
             "req_num": i,
             "text": line_map.get(f"REQ_{i}_TEXT"),
-            "status": line_map.get(f"REQ_{i}_STATUS"),
+            "status": status,
+            "status_raw": raw_status if raw_status != status else None,
             "evidence": line_map.get(f"REQ_{i}_EVIDENCE"),
             "rationale": line_map.get(f"REQ_{i}_RATIONALE"),
             "fit_score": None,

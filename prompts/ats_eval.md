@@ -14,9 +14,11 @@ Hard rules:
 - Keep every value on a single line. Do not use line breaks inside values.
 - Choose between 6 and 10 requirements that are explicitly stated or strongly implied in the JOB_DESCRIPTION. Include only substantive requirements — skip generic boilerplate. Use exactly as many as the JD warrants.
 - Evidence rule:
-  - If REQ_n_STATUS is met or partial, REQ_n_EVIDENCE MUST be a verbatim quote from the RESUME.
-  - If you cannot quote a verbatim RESUME line, set REQ_n_EVIDENCE: null AND REQ_n_STATUS MUST be missing.
+  - The JOB_DESCRIPTION and RESUME are two separate documents. EVIDENCE must come ONLY from text between "--- RESUME ---" and the end. NEVER quote from the JOB_DESCRIPTION.
+  - If REQ_n_STATUS is met or partial, REQ_n_EVIDENCE MUST be a single verbatim quote from the RESUME — one continuous span of text, copied exactly. Do not splice, combine, or paraphrase multiple lines.
+  - If you cannot find a single verbatim RESUME line that supports the requirement, set REQ_n_EVIDENCE: null AND REQ_n_STATUS MUST be missing.
 - Use "null" when unknown or not applicable.
+- STATUS must be exactly one of: met, partial, missing. No other values.
 - FIT_SCORE guide (0-4 scale):
   0 = no evidence at all
   1 = weak/tangential connection
