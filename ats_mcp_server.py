@@ -38,7 +38,7 @@ WORKSPACE = os.environ.get(
     str(Path.home() / "Desktop" / "Job Search 2026"),
 )
 
-OLLAMA_TIMEOUT = 300  # seconds — large models can be slow on first load
+OLLAMA_TIMEOUT = 600  # seconds — large models can be slow on first load
 OLLAMA_START_TIMEOUT = 30  # seconds to wait for ollama serve to come up
 IDLE_TIMEOUT = int(os.environ.get("ATS_IDLE_TIMEOUT", "300"))  # seconds before auto-shutdown
 
