@@ -45,10 +45,12 @@ logger = logging.getLogger("ats-mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 
 # ---------------------------------------------------------------------------
-# In-flight job tracking
+# In-flight job tracking + sequential queue
 # ---------------------------------------------------------------------------
 
 _running_jobs: dict[str, dict] = {}  # job_folder_name -> status dict
+_job_queue: asyncio.Queue | None = None
+_queue_order: list[str] = []  # ordered list of queued job keys
 
 # ---------------------------------------------------------------------------
 # Ollama helpers
@@ -117,6 +119,17 @@ async def _ensure_model(model: str) -> None:
         if r.status_code != 200:
             raise RuntimeError(f"Failed to pull model '{model}': {r.text}")
     logger.info(f"Model '{model}' pulled successfully.")
+
+
+async def _list_ollama_models() -> list[str]:
+    """Return list of locally available Ollama model names."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{OLLAMA_HOST}/api/tags", timeout=10)
+            tags = r.json()
+            return [m["name"] for m in tags.get("models", [])]
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return []
 
 
 async def _generate(prompt: str, model: str) -> str:
@@ -230,10 +243,8 @@ def parse_ats_report(raw_text: str) -> dict:
         "work_mode": None,
         "employment_type": None,
         "requirements": [],
-        "screen_out_flags": None,
         "top_gaps": None,
         "top_strengths": None,
-        "rejection_likelihood": None,
         "notes": None,
     }
 
@@ -253,17 +264,9 @@ def parse_ats_report(raw_text: str) -> dict:
     result["location"] = line_map.get("LOCATION")
     result["work_mode"] = line_map.get("WORK_MODE")
     result["employment_type"] = line_map.get("EMPLOYMENT_TYPE")
-    result["screen_out_flags"] = line_map.get("SCREEN_OUT_FLAGS")
     result["top_gaps"] = line_map.get("TOP_GAPS")
     result["top_strengths"] = line_map.get("TOP_STRENGTHS")
     result["notes"] = line_map.get("NOTES")
-
-    rl = line_map.get("REJECTION_LIKELIHOOD")
-    if rl:
-        try:
-            result["rejection_likelihood"] = float(rl)
-        except ValueError:
-            result["rejection_likelihood"] = rl
 
     for i in range(1, 9):
         req = {
@@ -271,18 +274,43 @@ def parse_ats_report(raw_text: str) -> dict:
             "status": line_map.get(f"REQ_{i}_STATUS"),
             "evidence": line_map.get(f"REQ_{i}_EVIDENCE"),
             "rationale": line_map.get(f"REQ_{i}_RATIONALE"),
-            "confidence": None,
+            "fit_score": None,
         }
-        conf = line_map.get(f"REQ_{i}_CONFIDENCE")
-        if conf:
+        raw_score = line_map.get(f"REQ_{i}_FIT_SCORE")
+        if raw_score is not None:
             try:
-                req["confidence"] = float(conf)
+                req["fit_score"] = int(raw_score)
             except ValueError:
-                req["confidence"] = conf
+                try:
+                    req["fit_score"] = int(float(raw_score))
+                except ValueError:
+                    req["fit_score"] = 0
         if req["text"]:
             result["requirements"].append(req)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Deterministic scoring
+# ---------------------------------------------------------------------------
+
+
+def compute_fit_score(parsed: dict) -> dict:
+    """Compute overall fit score from per-requirement fit scores."""
+    reqs = parsed["requirements"]
+    if not reqs:
+        return {"overall_fit_pct": 0.0, "total_score": 0, "max_possible": 0}
+
+    total = sum(r.get("fit_score") or 0 for r in reqs)
+    max_possible = len(reqs) * 10
+    overall = round((total / max_possible) * 100, 1)
+
+    return {
+        "overall_fit_pct": overall,
+        "total_score": total,
+        "max_possible": max_possible,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +350,10 @@ async def _run_eval_background(
         parsed["model_used"] = model
         parsed["resume_used"] = used_resume
 
+        # Compute deterministic overall fit score
+        fit = compute_fit_score(parsed)
+        parsed.update(fit)
+
         suffix = f"_{output_version}" if output_version else ""
 
         txt_path = job_folder / f"ats_report{suffix}.txt"
@@ -343,6 +375,28 @@ async def _run_eval_background(
         logger.exception("ATS eval failed")
         status["status"] = "error"
         status["error"] = str(e)
+
+
+# ---------------------------------------------------------------------------
+# Sequential job queue worker
+# ---------------------------------------------------------------------------
+
+
+async def _queue_worker():
+    """Single worker that processes eval jobs sequentially (GPU constraint)."""
+    global _job_queue
+    while True:
+        job_args = await _job_queue.get()
+        job_key = job_args[0]  # job_folder_name
+        try:
+            await _run_eval_background(*job_args)
+        except Exception:
+            logger.exception(f"Queue worker: job '{job_key}' failed unexpectedly")
+        finally:
+            # Remove from queue order tracking
+            if job_key in _queue_order:
+                _queue_order.remove(job_key)
+            _job_queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +442,15 @@ async def list_tools() -> list[Tool]:
                             "Default: no suffix."
                         ),
                     },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional: Ollama model to use for this eval "
+                            "(e.g., 'qwen3.5:9b', 'mistral:7b', 'llama3.1:8b'). "
+                            "Use list_available_models to see installed models. "
+                            "Default: OLLAMA_MODEL env var."
+                        ),
+                    },
                 },
                 "required": ["job_folder_name"],
             },
@@ -396,8 +459,8 @@ async def list_tools() -> list[Tool]:
             name="check_ats_eval",
             description=(
                 "Check the status of a running ATS evaluation. "
-                "Returns 'pending', 'generating', 'complete', or 'error'. "
-                "When complete, returns the full parsed report."
+                "Returns 'queued', 'pending', 'generating', 'complete', or 'error'. "
+                "When complete, returns the full parsed report with fit scores."
             ),
             inputSchema={
                 "type": "object",
@@ -408,6 +471,17 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["job_folder_name"],
+            },
+        ),
+        Tool(
+            name="list_available_models",
+            description=(
+                "List locally installed Ollama models. "
+                "Use this to see what models are available before running an eval."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
             },
         ),
     ]
@@ -422,15 +496,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return await _handle_run_ats_eval(arguments)
     elif name == "check_ats_eval":
         return await _handle_check_ats_eval(arguments)
+    elif name == "list_available_models":
+        return await _handle_list_models(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
 async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
-    """Kick off the eval in the background and return immediately."""
+    """Kick off the eval via the sequential queue and return immediately."""
+    global _job_queue
+
     job_folder_name = arguments["job_folder_name"]
     resume_filename = arguments.get("resume_filename")
-    model = OLLAMA_MODEL
+    model = arguments.get("model") or OLLAMA_MODEL
     output_version = arguments.get("output_version", "")
 
     try:
@@ -442,19 +520,25 @@ async def _handle_run_ats_eval(arguments: dict) -> list[TextContent]:
                 text=f"Error: Job folder not found: {job_folder}",
             )]
 
-        _running_jobs[job_folder_name] = {"status": "pending", "started": time.time()}
+        _running_jobs[job_folder_name] = {"status": "queued", "started": time.time()}
+        _queue_order.append(job_folder_name)
 
-        asyncio.create_task(_run_eval_background(
+        await _job_queue.put((
             job_folder_name, job_folder, workspace,
             resume_filename, model, output_version,
         ))
 
+        position = len(_queue_order)
+        queue_msg = ""
+        if position > 1:
+            queue_msg = f" Queue position: {position} of {position}."
+
         return [TextContent(
             type="text",
             text=(
-                f"ATS evaluation started for '{job_folder_name}' using model '{model}'.\n"
+                f"ATS evaluation queued for '{job_folder_name}' using model '{model}'.{queue_msg}\n"
                 f"Use check_ats_eval with job_folder_name='{job_folder_name}' to poll for results.\n"
-                f"This typically takes 2-5 minutes."
+                f"This typically takes 2-5 minutes per eval."
             ),
         )]
 
@@ -472,6 +556,15 @@ async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
         return [TextContent(
             type="text",
             text=f"No evaluation found for '{job_folder_name}'. Run run_ats_eval first.",
+        )]
+
+    if status["status"] == "queued":
+        elapsed = int(time.time() - status["started"])
+        position = _queue_order.index(job_folder_name) + 1 if job_folder_name in _queue_order else "?"
+        total = len(_queue_order)
+        return [TextContent(
+            type="text",
+            text=f"Status: queued (position {position} of {total}, {elapsed}s elapsed). Try again in 60s.",
         )]
 
     if status["status"] == "pending":
@@ -496,26 +589,27 @@ async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
 
     # Complete
     parsed = status["parsed"]
-    rl = parsed.get("rejection_likelihood", "?")
+    overall_fit = parsed.get("overall_fit_pct", "?")
+    total_score = parsed.get("total_score", "?")
+    max_possible = parsed.get("max_possible", "?")
     gaps = parsed.get("top_gaps", "None identified")
     strengths = parsed.get("top_strengths", "None identified")
-    flags = parsed.get("screen_out_flags", "None")
 
     reqs_summary = []
     for r in parsed.get("requirements", []):
         icon = {"met": "✓", "partial": "~", "missing": "✗"}.get(r.get("status", ""), "?")
-        reqs_summary.append(f"  {icon} {r.get('text', '?')} [{r.get('status', '?')}]")
+        score = r.get("fit_score", "?")
+        reqs_summary.append(f"  {icon} [{score}/10] {r.get('text', '?')} [{r.get('status', '?')}]")
 
     summary = (
         f"Status: complete\n\n"
         f"Job: {parsed.get('company', '?')} — {parsed.get('job_title', '?')}\n"
         f"Model: {parsed.get('model_used', '?')}\n"
         f"Resume: {parsed.get('resume_used', '?')}\n\n"
-        f"Rejection Likelihood: {rl}\n\n"
+        f"Overall Fit: {overall_fit}% ({total_score}/{max_possible})\n\n"
         f"Requirements:\n" + "\n".join(reqs_summary) + "\n\n"
         f"Top Gaps: {gaps}\n"
-        f"Top Strengths: {strengths}\n"
-        f"Screen-out Flags: {flags}\n\n"
+        f"Top Strengths: {strengths}\n\n"
         f"Reports saved to:\n"
         f"  {status['txt_path']}\n"
         f"  {status['json_path']}\n\n"
@@ -523,6 +617,22 @@ async def _handle_check_ats_eval(arguments: dict) -> list[TextContent]:
     )
 
     return [TextContent(type="text", text=summary)]
+
+
+async def _handle_list_models(arguments: dict) -> list[TextContent]:
+    """List locally available Ollama models."""
+    try:
+        await _ensure_ollama()
+        models = await _list_ollama_models()
+        if not models:
+            return [TextContent(type="text", text="No models installed. Pull one with 'ollama pull <model>'.")]
+        model_list = "\n".join(f"  - {m}" for m in sorted(models))
+        return [TextContent(
+            type="text",
+            text=f"Available Ollama models:\n{model_list}\n\nDefault: {OLLAMA_MODEL}",
+        )]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error listing models: {e}")]
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +646,7 @@ async def _idle_watchdog():
         await asyncio.sleep(30)
         idle = time.monotonic() - _last_activity
         # Don't shut down if there are running jobs
-        active = any(j["status"] in ("pending", "generating") for j in _running_jobs.values())
+        active = any(j["status"] in ("queued", "pending", "generating") for j in _running_jobs.values())
         if idle >= IDLE_TIMEOUT and not active:
             logger.info(
                 f"No activity for {IDLE_TIMEOUT}s — shutting down. "
@@ -546,6 +656,10 @@ async def _idle_watchdog():
 
 
 async def main():
+    global _job_queue
+    _job_queue = asyncio.Queue()
+    asyncio.create_task(_queue_worker())
+
     async with stdio_server() as (read_stream, write_stream):
         asyncio.create_task(_idle_watchdog())
         await app.run(read_stream, write_stream, app.create_initialization_options())
